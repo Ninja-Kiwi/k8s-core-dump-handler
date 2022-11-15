@@ -9,9 +9,11 @@ use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 use std::process;
+use std::process::Command;
 use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
+use uuid::Uuid;
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
@@ -53,6 +55,78 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
     info!("Set logfile to: {:?}", &log_path);
     debug!("Creating dump for {}", cc.get_templated_name());
 
+    // save core dump to disk so we can extract the env vars using grep
+    let tmp_uuid = Uuid::new_v4();
+    let core_path = format!("/tmp/tmp_{}.core", tmp_uuid);
+    {
+        let mut core_file = match File::create(core_path.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to create file: {}", e);
+                process::exit(1);
+            }
+        };
+        core_file.lock(FileLockMode::Exclusive)?;
+
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+
+        match io::copy(&mut stdin, &mut core_file) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Error writing core file \n{}", e);
+                process::exit(1);
+            }
+        };
+        core_file.flush()?;
+        core_file.unlock()?;
+    }
+
+    let env_var_name = "POD_NAME=";
+    let get_podname_exec = Command::new("sh")
+        .arg("-c")
+        .arg(format!("strings -a {} | grep {}", core_path, env_var_name))
+        .output()
+        .expect("failed to execute process");
+
+    let podname_env_output = String::from_utf8(get_podname_exec.stdout)?;
+    
+    // if we couldn't find the podname env variable then default to hostname
+    let podname_str = if podname_env_output.is_empty() {
+        cc.params.hostname.clone()
+    }
+    else {
+        // strip out 'POD_NAME=' from the returned string
+        let podname_env_err = String::from_utf8(get_podname_exec.stderr)?;
+        let pn_start = env_var_name.len();
+        let pn_end = podname_env_output.len();
+
+        if pn_end <= pn_start {
+            error!("Failed to remove {} from {}. pn_start: {}. pn_end: {}. Error: {}", env_var_name, podname_env_output, pn_start, pn_end, podname_env_err);
+            process::exit(1);
+        }
+    
+        String::from(&podname_env_output[pn_start..pn_end])
+    };
+
+    // extract the core dump saved to disk
+    let mut core_buffer = Vec::new();
+    {
+        let mut core_file = match File::open(core_path.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to open file: {}", e);
+                process::exit(1);
+            }
+        };
+
+        // read the whole file and delete it
+        core_file.read_to_end(&mut core_buffer)?;
+    }
+
+    // delete the emp core dump
+    std::fs::remove_file(core_path.clone())?;
+
     let l_crictl_config_path = cc.crictl_config_path.clone();
 
     let config_path = if cc.use_crio_config {
@@ -72,7 +146,8 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
         config_path,
         image_command: l_image_command,
     };
-    let pod_object = match cli.pod(&cc.params.hostname) {
+
+    let pod_object = match cli.pod(&podname_str) {
         Ok(v) => v,
         Err(e) => {
             error!("{}", e);
@@ -162,10 +237,7 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
         Err(e) => error!("Error starting core file \n{}", e),
     };
 
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-
-    match io::copy(&mut stdin, &mut zip) {
+    match zip.write_all(&mut core_buffer) {
         Ok(v) => v,
         Err(e) => {
             error!("Error writing core file \n{}", e);
