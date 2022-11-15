@@ -67,6 +67,7 @@ fn timeout_scenario() -> Result<(), std::io::Error> {
         .expect("Couldn't execute");
 
     println!("{}", String::from_utf8_lossy(&cdc.stdout));
+    println!("{}", String::from_utf8_lossy(&cdc.stderr));
     assert_eq!("timeout\n", String::from_utf8_lossy(&cdc.stdout));
     assert_eq!(1, *&cdc.status.code().unwrap());
     Ok(())
